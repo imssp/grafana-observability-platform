@@ -1,0 +1,56 @@
+name: Validate and deploy observability as code (ephemeral lab)
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test-and-deploy-to-temporary-grafana:
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_grafana_url: http://127.0.0.1:3000
+      # Demo credentials ONLY: Grafana runs only on isolated GitHub runner.
+      TF_VAR_grafana_auth: admin:admin
+      GRAFANA_ADMIN_PASSWORD: admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.11.0'
+      - name: Static checks
+        run: |
+          docker compose config --quiet
+          python -m json.tool dashboards/app-overview.json > /dev/null
+          terraform -chdir=terraform fmt -check
+      - name: Start monitoring test stack
+        run: docker compose up -d --build
+      - name: Wait for Grafana health
+        run: |
+          for i in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:3000/api/health > /dev/null; then exit 0; fi
+            sleep 3
+          done
+          docker compose logs --tail=80
+          exit 1
+      - name: Terraform init and validate
+        run: |
+          terraform -chdir=terraform init -input=false
+          terraform -chdir=terraform validate
+      - name: Preview changes
+        run: terraform -chdir=terraform plan -input=false -out=tfplan
+      - name: Deploy dashboards and alert rules in temporary Grafana
+        if: github.event_name == 'push'
+        run: terraform -chdir=terraform apply -input=false -auto-approve tfplan
+      - name: Smoke test API deployment
+        if: github.event_name == 'push'
+        run: |
+          python -m pip install requests
+          python api/manage_grafana.py provision
+          curl -fsS -u admin:admin http://127.0.0.1:3000/api/dashboards/uid/demo-overview
+          curl -fsS -u admin:admin http://127.0.0.1:3000/api/dashboards/uid/api-dashboard
+      - name: Debug output on failure
+        if: failure()
+        run: docker compose logs --tail=100
+      - name: Teardown test environment
+        if: always()
+        run: docker compose down -v
